@@ -22,6 +22,7 @@
 
 #pragma once
 
+#include "eos-refcounted.h"
 #include "eos-updater-generated.h"
 #include "eos-updater-types.h"
 #include <glib.h>
@@ -60,5 +61,29 @@ gboolean eos_updater_get_upgrade_info (OstreeRepo *repo,
                                        GError **error);
 
 gchar *eos_updater_get_booted_checksum (GError **error);
+
+gchar * eos_updater_dup_envvar_or (const gchar *envvar,
+                                   const gchar *default_value);
+
+OstreeDeployment *eos_updater_get_booted_deployment_from_loaded_sysroot (OstreeSysroot *sysroot,
+                                                                         GError **error);
+
+#define EOS_TYPE_QUIT_FILE eos_quit_file_get_type ()
+EOS_DECLARE_REFCOUNTED (EosQuitFile, eos_quit_file, EOS, QUIT_FILE)
+
+typedef enum
+{
+  EOS_QUIT_FILE_QUIT,
+  EOS_QUIT_FILE_KEEP_CHECKING
+} EosQuitFileCheckResult;
+
+typedef EosQuitFileCheckResult (* EosQuitFileCheckCallback) (gpointer user_data);
+
+EosQuitFile *eos_updater_setup_quit_file (const gchar *path,
+                                          EosQuitFileCheckCallback check_callback,
+                                          gpointer user_data,
+                                          GDestroyNotify notify,
+                                          guint timeout_seconds,
+                                          GError **error);
 
 G_END_DECLS

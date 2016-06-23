@@ -23,8 +23,9 @@
 #include "eos-updater-util.h"
 #include <ostree.h>
 #include <libsoup/soup.h>
+#if 0
 #include <eosmetrics/eosmetrics.h>
-
+#endif
 
 /*
  * Records which branch will be used by the updater. The payload is a 4-tuple
@@ -155,6 +156,57 @@ static const gchar *const dmi_attributes[] =
     NULL,
   };
 
+static gboolean
+fallback_to_the_fake_deployment (void)
+{
+  const gchar *value = NULL;
+
+  value = g_getenv ("EOS_UPDATER_TEST_UPDATER_DEPLOYMENT_FALLBACK");
+
+  return value != NULL;
+}
+
+static OstreeDeployment *
+get_fake_deployment (OstreeSysroot *sysroot,
+                     GError **error)
+{
+  static OstreeDeployment *fake_booted_deployment = NULL;
+
+  if (fake_booted_deployment == NULL)
+    {
+      g_autoptr(GPtrArray) deployments = NULL;
+
+      deployments = ostree_sysroot_get_deployments (sysroot);
+      if (deployments->len == 0)
+        {
+          g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_NOT_FOUND,
+                               "No deployments found at all");
+          return NULL;
+        }
+      fake_booted_deployment = g_object_ref (g_ptr_array_index (deployments, 0));
+    }
+
+  return g_object_ref (fake_booted_deployment);
+}
+
+OstreeDeployment *
+eos_updater_get_booted_deployment_from_loaded_sysroot (OstreeSysroot *sysroot,
+                                                       GError **error)
+{
+  OstreeDeployment *booted_deployment = NULL;
+
+  booted_deployment = ostree_sysroot_get_booted_deployment (sysroot);
+  if (booted_deployment != NULL)
+    return g_object_ref (booted_deployment);
+
+  if (fallback_to_the_fake_deployment ())
+    return get_fake_deployment (sysroot, error);
+
+  g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_NOT_FOUND,
+                       "Not an ostree system");
+  return NULL;
+}
+
 static OstreeDeployment *
 get_booted_deployment (GError **error)
 {
@@ -230,6 +282,63 @@ get_baseurl (OstreeDeployment *booted_deployment,
 #define VENDOR_KEY "sys_vendor"
 #define PRODUCT_KEY "product_name"
 
+gchar *
+eos_updater_dup_envvar_or (const gchar *envvar,
+                           const gchar *default_value)
+{
+  const gchar *value = g_getenv (envvar);
+
+  if (value != NULL)
+    return g_strdup (value);
+
+  return g_strdup (default_value);
+}
+
+static gchar *
+get_custom_descriptors_path (void)
+{
+  return eos_updater_dup_envvar_or ("EOS_UPDATER_TEST_UPDATER_CUSTOM_DESCRIPTORS_PATH",
+                                    NULL);
+}
+
+static void
+get_custom_hw_descriptors (GHashTable *hw_descriptors,
+                           const gchar *path)
+{
+  g_autoptr(GKeyFile) keyfile = NULL;
+  g_auto(GStrv) keys = NULL;
+  gchar **iter;
+  const gchar *group = "descriptors";
+
+  keyfile = g_key_file_new ();
+  if (!g_key_file_load_from_file (keyfile,
+                                  path,
+                                  G_KEY_FILE_NONE,
+                                  NULL))
+    return;
+
+  keys = g_key_file_get_keys (keyfile,
+                              group,
+                              NULL,
+                              NULL);
+  if (keys == NULL)
+    return;
+
+  for (iter = keys; *iter != NULL; ++iter)
+    {
+      const gchar *key = *iter;
+      gchar *value = g_key_file_get_string (keyfile,
+                                            group,
+                                            key,
+                                            NULL);
+
+      if (value == NULL)
+        continue;
+
+      g_hash_table_insert (hw_descriptors, g_strdup (key), value);
+    }
+}
+
 static void
 get_arm_hw_descriptors (GHashTable *hw_descriptors)
 {
@@ -279,8 +388,12 @@ get_hw_descriptors (void)
 {
   GHashTable *hw_descriptors = g_hash_table_new_full (g_str_hash, g_str_equal,
                                                       g_free, g_free);
+  g_autofree gchar *custom_descriptors = get_custom_descriptors_path ();
 
-  if (g_file_test (DT_COMPATIBLE, G_FILE_TEST_EXISTS))
+  if (custom_descriptors != NULL)
+    get_custom_hw_descriptors (hw_descriptors,
+                               custom_descriptors);
+  else if (g_file_test (DT_COMPATIBLE, G_FILE_TEST_EXISTS))
     { /* ARM */
       get_arm_hw_descriptors (hw_descriptors);
     }
@@ -417,12 +530,14 @@ maybe_send_metric (const gchar *vendor,
   message ("Recording metric event %s: (%s, %s, %s, %d)",
            EOS_UPDATER_BRANCH_SELECTED, vendor, product,
            ref, on_hold);
+#if 0
   emtr_event_recorder_record_event_sync (emtr_event_recorder_get_default (),
                                          EOS_UPDATER_BRANCH_SELECTED,
                                          g_variant_new ("(sssb)", vendor,
                                                         product,
                                                         ref,
                                                         on_hold));
+#endif
   metric_sent = TRUE;
 }
 
@@ -523,4 +638,129 @@ eos_updater_get_booted_checksum (GError **error)
     return NULL;
 
   return get_booted_checksum (booted_deployment);
+}
+
+struct _EosQuitFile
+{
+  GObject parent_instance;
+
+  GFileMonitor *monitor;
+  guint signal_id;
+  guint timeout_seconds;
+  guint timeout_id;
+  EosQuitFileCheckCallback callback;
+  gpointer user_data;
+  GDestroyNotify notify;
+};
+
+static void
+quit_clear_user_data (EosQuitFile *quit_file)
+{
+  gpointer user_data = g_steal_pointer (&quit_file->user_data);
+  GDestroyNotify notify = g_steal_pointer (&quit_file->notify);
+
+  if (notify != NULL)
+    notify (user_data);
+}
+
+static void
+quit_disconnect_monitor (EosQuitFile *quit_file)
+{
+  guint id = quit_file->signal_id;
+
+  quit_file->signal_id = 0;
+  if (id > 0)
+    g_signal_handler_disconnect (quit_file->monitor, id);
+}
+
+static void
+quit_clear_source (EosQuitFile *quit_file)
+{
+  guint id = quit_file->timeout_id;
+
+  quit_file->timeout_id = 0;
+  if (id > 0)
+    g_source_remove (id);
+}
+
+static void
+eos_quit_file_dispose_impl (EosQuitFile *quit_file)
+{
+  quit_clear_user_data (quit_file);
+  quit_clear_source (quit_file);
+  quit_disconnect_monitor (quit_file);
+  g_clear_object (&quit_file->monitor);
+}
+
+EOS_DEFINE_REFCOUNTED (EOS_QUIT_FILE,
+                       EosQuitFile,
+                       eos_quit_file,
+                       eos_quit_file_dispose_impl,
+                       NULL)
+
+static gboolean
+quit_file_source_func (gpointer quit_file_ptr)
+{
+  EosQuitFile *quit_file = EOS_QUIT_FILE (quit_file_ptr);
+
+  if (quit_file->callback (quit_file->user_data) == EOS_QUIT_FILE_KEEP_CHECKING)
+    return G_SOURCE_CONTINUE;
+
+  quit_file->timeout_id = 0;
+  quit_clear_user_data (quit_file);
+  return G_SOURCE_REMOVE;
+}
+
+static void
+on_quit_file_changed (GFileMonitor *monitor,
+                      GFile *file,
+                      GFile *other,
+                      GFileMonitorEvent event,
+                      gpointer quit_file_ptr)
+{
+  EosQuitFile *quit_file = EOS_QUIT_FILE (quit_file_ptr);
+
+  if (event != G_FILE_MONITOR_EVENT_DELETED)
+    return;
+
+  if (quit_file->callback (quit_file->user_data) == EOS_QUIT_FILE_KEEP_CHECKING)
+    quit_file->timeout_id = g_timeout_add_seconds (quit_file->timeout_seconds,
+                                                   quit_file_source_func,
+                                                   quit_file);
+  g_signal_handler_disconnect (quit_file->monitor, quit_file->signal_id);
+  quit_file->signal_id = 0;
+}
+
+EosQuitFile *
+eos_updater_setup_quit_file (const gchar *path,
+                             EosQuitFileCheckCallback check_callback,
+                             gpointer user_data,
+                             GDestroyNotify notify,
+                             guint timeout_seconds,
+                             GError **error)
+{
+  g_autoptr(GFile) file = NULL;
+  g_autoptr(GFileMonitor) monitor = NULL;
+  g_autoptr(EosQuitFile) quit_file = NULL;
+
+  file = g_file_new_for_path (path);
+  monitor = g_file_monitor_file (file,
+                                 G_FILE_MONITOR_NONE,
+                                 NULL,
+                                 error);
+  if (monitor == NULL)
+    return NULL;
+
+  quit_file = g_object_new (EOS_TYPE_QUIT_FILE, NULL);
+  quit_file->monitor = g_steal_pointer (&monitor);
+  quit_file->signal_id = g_signal_connect (quit_file->monitor,
+                                           "changed",
+                                           G_CALLBACK (on_quit_file_changed),
+                                           quit_file);
+  quit_file->timeout_seconds = timeout_seconds;
+  quit_file->callback = check_callback;
+  quit_file->user_data = user_data;
+  quit_file->notify = notify;
+
+  return g_steal_pointer (&quit_file);
 }

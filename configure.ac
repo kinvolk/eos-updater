@@ -25,10 +25,11 @@ PKG_CHECK_MODULES([EOS_AUTOUPDATER],
 PKG_CHECK_MODULES([EOS_UPDATER],
                   [gio-unix-2.0 >= $GLIB_REQUIRED_VERSION
                   ostree-1 >= OSTREE_REQUIRED_VERSION
-                  libsoup-2.4
-                  eosmetrics-0])
+                  libsoup-2.4])
 AC_PATH_PROG([XSLTPROC], [xsltproc], [AC_MSG_ERROR([xsltproc required for build])])
 AC_PATH_PROG([GDBUS_CODEGEN], [gdbus-codegen], [AC_MSG_ERROR([gdbus-codegen required for build])])
+AC_PATH_PROG([OSTREE], [ostree], [AC_MSG_ERROR([ostree required for testing])])
+AC_PATH_PROG([GPG], [gpg], [AC_MSG_ERROR([gpg required for testing])])
 
 AC_CONFIG_HEADERS([config.h])
 AC_CONFIG_FILES([
